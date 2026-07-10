@@ -1,0 +1,17 @@
+Enhancement: Allow backing up directly from an S3 bucket or an rclone remote
+
+The `backup` command now accepts an S3 location or an rclone remote as its
+source, for example `restic backup s3:s3.example.com/mybucket/prefix` or
+`restic backup rclone:myremote:bucket/path`. Data is read straight from the
+remote service, without mounting it first, and stored with restic's usual
+deduplication, encryption and snapshot handling.
+Credentials for an S3 source are read from `$RESTIC_SOURCE_ACCESS_KEY_ID`
+and `$RESTIC_SOURCE_SECRET_ACCESS_KEY`, falling back to the default
+AWS/MinIO credential chain; rclone sources use the regular rclone
+configuration.
+
+Unchanged objects are detected via size and modification time and skipped
+without any data transfer, like unchanged files in a local backup.
+
+https://github.com/restic/restic/issues/2529
+https://github.com/restic/restic/issues/299

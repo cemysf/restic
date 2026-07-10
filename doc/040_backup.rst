@@ -742,6 +742,75 @@ the pipe and act accordingly (e.g., remove the last backup). Refer to the
 `Use the Unofficial Bash Strict Mode <http://redsymbol.net/articles/unofficial-bash-strict-mode/>`__
 for more details on this.
 
+Reading data from an S3 bucket
+******************************
+
+Restic can back up the contents of an S3-compatible bucket directly, without
+mounting it first. Instead of a local path, pass an S3 location as the single
+backup source:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo backup s3:s3.example.com/mybucket/some/prefix
+
+The same location formats as for the S3 repository backend are supported
+(``s3:host/bucket/prefix``, ``s3:https://host/bucket/prefix`` and
+``s3://host/bucket/prefix``). Only the objects below the given prefix are
+backed up; the prefix may be omitted to back up the whole bucket. Object keys
+are interpreted as ``/``-separated paths, so the snapshot contains the same
+directory tree that tools like ``rclone`` or the AWS console display.
+
+Credentials for the *source* bucket are read from
+``$RESTIC_SOURCE_ACCESS_KEY_ID`` and
+``$RESTIC_SOURCE_SECRET_ACCESS_KEY`` (optionally
+``$RESTIC_SOURCE_SESSION_TOKEN`` and
+``$RESTIC_SOURCE_DEFAULT_REGION``). These are separate from the standard
+``$AWS_*`` variables so that they cannot collide with the credentials of an S3
+repository backend used as the destination. If they are unset, the default
+AWS/MinIO credential chain (``$AWS_*`` environment variables, credential
+files, IAM instance profiles) is used instead.
+
+Change detection works the same way as for local files: an object is only
+read again if its size or modification time changed since the parent
+snapshot. Unchanged objects are skipped without transferring any data.
+Since S3 has no inodes, restic derives a stable inode number from each object
+key; directories synthesized from key prefixes always use a fixed timestamp.
+
+Note that S3 provides no atomic snapshot of a bucket: objects that are
+added, changed or removed while the backup is running may or may not be
+included, just like files that change during a local filesystem backup.
+``--stdin``, ``--stdin-from-command``, ``--files-from`` and
+``--use-fs-snapshot`` cannot be combined with an S3 source.
+
+Reading data from an rclone remote
+**********************************
+
+Any remote supported by `rclone <https://rclone.org/>`__ can also be used as
+the backup source directly, without mounting it first. Pass the rclone
+location prefixed with ``rclone:`` as the single backup source:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo backup rclone:mys3:bucket/path
+    $ restic -r /srv/restic-repo backup rclone:mywebdav:documents
+
+The remote is accessed by executing the ``rclone`` binary: listings and
+metadata via ``rclone lsjson``, file contents via ``rclone cat``. The rclone
+configuration is taken from the usual places (``rclone config``,
+``RCLONE_CONFIG_*`` environment variables, connection strings), so both an
+rclone repository backend and an rclone source can be used in the same
+invocation as long as they use different remote names. A different rclone
+binary can be selected with ``$RESTIC_SOURCE_RCLONE_PROGRAM``.
+
+Change detection works like for the S3 source: files are skipped without any
+data transfer when size and modification time are unchanged since the parent
+snapshot. Timestamps are compared with one-second granularity. Since reading
+a file spawns one rclone process per file, backups of many small changed
+files are slower than over a native protocol; unchanged files are unaffected.
+The same restrictions as for an S3 source apply (single source argument, no
+``--stdin``/``--files-from``/``--use-fs-snapshot``), and file ownership,
+permissions and other source-side metadata are not preserved.
+
 Tags for backup
 ***************
 

@@ -19,6 +19,8 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/restic/restic/internal/archiver"
+	"github.com/restic/restic/internal/backend"
+	backends3 "github.com/restic/restic/internal/backend/s3"
 	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
@@ -465,6 +467,106 @@ func collectTargets(opts BackupOptions, args []string, warnf func(msg string, ar
 	return filterExisting(targets, warnf)
 }
 
+// remoteSource is a backup source that reads from a remote service instead
+// of the local filesystem.
+type remoteSource struct {
+	// display is a human-readable description for verbose output
+	display string
+	// targets are the paths within the source file system to back up
+	targets []string
+	// open creates the source file system
+	open func(ctx context.Context, gopts global.Options) (fs.FS, error)
+}
+
+// parseRemoteSource detects whether the single backup target names a remote
+// source: an S3 location ("s3:host/bucket/prefix", "s3:https://host/bucket/prefix"
+// or "s3://host/bucket/prefix") or an rclone remote ("rclone:remote:path").
+// In that case the data is read directly from the remote service instead of
+// a local filesystem path. Returns nil if the arguments do not name a remote
+// source.
+func parseRemoteSource(opts BackupOptions, args []string) (*remoteSource, error) {
+	if opts.Stdin || opts.StdinCommand || len(args) != 1 {
+		return nil, nil
+	}
+
+	var src *remoteSource
+	switch {
+	case strings.HasPrefix(args[0], "s3:"):
+		cfg, err := backends3.ParseConfig(args[0])
+		if err != nil {
+			return nil, errors.Fatalf("invalid s3 source %q: %v", args[0], err)
+		}
+		if cfg.Bucket == "" {
+			return nil, errors.Fatalf("invalid s3 source %q: bucket name not found", args[0])
+		}
+		src = &remoteSource{
+			display: fmt.Sprintf("S3 bucket %v at %v", cfg.Bucket, cfg.Endpoint),
+			// the S3 file system is rooted at the bucket, the backup target
+			// within it is the (possibly empty) key prefix
+			targets: []string{path.Join("/", cfg.Prefix)},
+			open: func(ctx context.Context, gopts global.Options) (fs.FS, error) {
+				return newS3SourceFS(ctx, cfg, gopts)
+			},
+		}
+
+	case strings.HasPrefix(args[0], "rclone:"):
+		remote := strings.TrimPrefix(args[0], "rclone:")
+		if remote == "" {
+			return nil, errors.Fatalf("invalid rclone source %q: remote not found", args[0])
+		}
+		src = &remoteSource{
+			display: fmt.Sprintf("rclone remote %v", remote),
+			// the rclone file system is rooted at the given remote path
+			targets: []string{"/"},
+			open: func(ctx context.Context, _ global.Options) (fs.FS, error) {
+				return fs.NewRclone(ctx, fs.RcloneOptions{
+					Remote:  remote,
+					Program: os.Getenv("RESTIC_SOURCE_RCLONE_PROGRAM"),
+				})
+			},
+		}
+
+	default:
+		return nil, nil
+	}
+
+	if len(opts.FilesFrom)+len(opts.FilesFromVerbatim)+len(opts.FilesFromRaw) > 0 {
+		return nil, errors.Fatal("--files-from cannot be used with a remote source")
+	}
+	if opts.UseFsSnapshot {
+		return nil, errors.Fatal("--use-fs-snapshot cannot be used with a remote source")
+	}
+	return src, nil
+}
+
+// newS3SourceFS opens the source bucket as a file system. Credentials are
+// taken from $RESTIC_SOURCE_ACCESS_KEY_ID and
+// $RESTIC_SOURCE_SECRET_ACCESS_KEY so that they cannot collide with the
+// credentials of an S3 repository backend; if unset, the default AWS/MinIO
+// credential chain is used.
+func newS3SourceFS(ctx context.Context, cfg *backends3.Config, gopts global.Options) (fs.FS, error) {
+	rt, err := backend.Transport(gopts.TransportOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	region := os.Getenv("RESTIC_SOURCE_DEFAULT_REGION")
+	if region == "" {
+		region = os.Getenv("AWS_DEFAULT_REGION")
+	}
+
+	return fs.NewS3(ctx, fs.S3Options{
+		Endpoint:     cfg.Endpoint,
+		Bucket:       cfg.Bucket,
+		UseHTTP:      cfg.UseHTTP,
+		Region:       region,
+		KeyID:        os.Getenv("RESTIC_SOURCE_ACCESS_KEY_ID"),
+		Secret:       os.Getenv("RESTIC_SOURCE_SECRET_ACCESS_KEY"),
+		SessionToken: os.Getenv("RESTIC_SOURCE_SESSION_TOKEN"),
+		Transport:    rt,
+	})
+}
+
 // parent returns the ID of the parent snapshot. If there is none, nil is
 // returned.
 func findParentSnapshot(ctx context.Context, repo restic.ListerLoaderUnpacked, opts BackupOptions, targets []string, timeStampLimit time.Time) (*data.Snapshot, error) {
@@ -516,13 +618,23 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		return err
 	}
 
-	success := true
-	targets, err := collectTargets(opts, args, printer.E, term.InputRaw())
+	remoteSrc, err := parseRemoteSource(opts, args)
 	if err != nil {
-		if errors.Is(err, ErrInvalidSourceData) {
-			success = false
-		} else {
-			return err
+		return err
+	}
+
+	success := true
+	var targets []string
+	if remoteSrc != nil {
+		targets = remoteSrc.targets
+	} else {
+		targets, err = collectTargets(opts, args, printer.E, term.InputRaw())
+		if err != nil {
+			if errors.Is(err, ErrInvalidSourceData) {
+				success = false
+			} else {
+				return err
+			}
 		}
 	}
 
@@ -620,6 +732,16 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 			return fmt.Errorf("failed to backup from stdin: %w", err)
 		}
 		targets = []string{filename}
+	}
+
+	if remoteSrc != nil {
+		if !gopts.JSON {
+			printer.V("read source data from %v", remoteSrc.display)
+		}
+		targetFS, err = remoteSrc.open(ctx, gopts)
+		if err != nil {
+			return err
+		}
 	}
 
 	if backupFSTestHook != nil {
